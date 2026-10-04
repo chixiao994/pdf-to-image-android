@@ -228,7 +228,7 @@ class PdfViewModel : ViewModel() {
                 w = (w * r).toInt().coerceAtLeast(1)
                 h = (h * r).toInt().coerceAtLeast(1)
             }
-            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             bmp.eraseColor(Color.WHITE)
             page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
             return bmp
