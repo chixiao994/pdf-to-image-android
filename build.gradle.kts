@@ -14,6 +14,7 @@ android {
         versionCode = 1
         versionName = "1.0"
         vectorDrawables { useSupportLibrary = true }
+        multiDexEnabled = true   // ← 新增
     }
 
     buildTypes {
