@@ -14,6 +14,7 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -22,75 +23,81 @@ import kotlin.math.sqrt
 
 class PdfViewModel : ViewModel() {
 
-    // ==================== 状态 ====================
+    // ==================== 预览状态 ====================
     var pdfUri: Uri? by mutableStateOf(null); private set
     var outputDirUri: Uri? by mutableStateOf(null); private set
     var pdfName: String by mutableStateOf(""); private set
     var pageCount: Int by mutableStateOf(0); private set
     var currentPage: Int by mutableStateOf(0); private set
     var currentBitmap: Bitmap? by mutableStateOf(null); private set
-    var skippedPages: Set<Int> by mutableStateOf(emptySet()); private set
-    var isLoading: Boolean by mutableStateOf(false); private set
-    var statusText: String by mutableStateOf(""); private set
+    var isPreviewLoading: Boolean by mutableStateOf(false); private set
+
+    // ==================== 导出状态（与预览独立） ====================
+    var isSaving: Boolean by mutableStateOf(false); private set
+    var saveProgressText: String by mutableStateOf(""); private set
+    var saveProgressValue: Float by mutableStateOf(0f); private set
+
     var toastMsg: String? by mutableStateOf(null)
 
-    private var pdfRenderer: PdfRenderer? = null
-    private var pfd: ParcelFileDescriptor? = null
-    private val exportedPages = mutableSetOf<Int>()
-
-    // 单线程调度器 —— 保证 PdfRenderer 串行访问
-    private val pdfExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "PdfRenderThread")
+    // ==================== 预览渲染器（独立线程） ====================
+    private var previewRenderer: PdfRenderer? = null
+    private var previewPfd: ParcelFileDescriptor? = null
+    private val previewExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "PreviewRenderThread")
     }
-    private val pdfDispatcher: CoroutineDispatcher = pdfExecutor.asCoroutineDispatcher()
+    private val previewDispatcher: CoroutineDispatcher = previewExecutor.asCoroutineDispatcher()
 
     companion object {
-        const val PREVIEW_DPI = 150
+        // 预览：低质量快速渲染，仅供屏幕显示
+        const val PREVIEW_DPI = 100
+        const val PREVIEW_MAX_SIDE = 1600
+
+        // 导出：无损级，300 DPI + PNG
         const val EXPORT_DPI = 300
-        // 单张位图内存上限（80MB），超限等比缩限，防止 OOM
-        const val MAX_BITMAP_BYTES = 80L * 1024 * 1024
+        // 单张导出位图内存上限 120MB，超限自动等比缩限（防 OOM）
+        const val EXPORT_MAX_BITMAP_BYTES = 120L * 1024 * 1024
     }
 
     // ==================================================
-    // 顶部「输入」：打开 PDF
+    // 顶部「输入」：打开 PDF（加载页数 + 渲染首页预览）
     // ==================================================
     fun openPdf(context: Context, uri: Uri) {
-        if (isLoading) return
+        if (isPreviewLoading) return
+        val appContext = context.applicationContext
         viewModelScope.launch {
-            isLoading = true
+            isPreviewLoading = true
             try {
-                withContext(pdfDispatcher) {
-                    closeInternal()
+                withContext(previewDispatcher) {
+                    closePreviewInternal()
                     try {
-                        val newPfd = context.contentResolver.openFileDescriptor(uri, "r")
+                        val pfd = appContext.contentResolver
+                            .openFileDescriptor(uri, "r")
                             ?: throw IllegalStateException("无法打开文件")
-                        val newRenderer = try {
-                            PdfRenderer(newPfd)
+                        val renderer = try {
+                            PdfRenderer(pfd)
                         } catch (t: Throwable) {
-                            newPfd.close()
-                            throw t
+                            pfd.close(); throw t
                         }
-                        pfd = newPfd
-                        pdfRenderer = newRenderer
+                        previewPfd = pfd
+                        previewRenderer = renderer
                         pdfUri = uri
-                        pdfName = queryFileName(context, uri) ?: "document.pdf"
-                        pageCount = newRenderer.pageCount
+                        pdfName = queryFileName(appContext, uri) ?: "document.pdf"
+                        pageCount = renderer.pageCount
                         currentPage = 0
-                        skippedPages = emptySet()
-                        exportedPages.clear()
                     } catch (t: Throwable) {
                         toastMsg = "打开失败：${t.message}"
                         return@withContext
                     }
-                    // 渲染首页
+                    // 渲染首页预览
                     try {
-                        currentBitmap = renderPageInternal(0, PREVIEW_DPI)
+                        val bmp = renderPreviewBitmap(0)
+                        currentBitmap = bmp
                     } catch (t: Throwable) {
                         toastMsg = "预览失败：${t.message}"
                     }
                 }
             } finally {
-                isLoading = false
+                isPreviewLoading = false
             }
         }
     }
@@ -98,26 +105,41 @@ class PdfViewModel : ViewModel() {
     fun setOutputDir(uri: Uri) { outputDirUri = uri }
 
     // ==================================================
-    // 顶部「保存」：整体导出（忽略跳过，全部页面都导出）
+    // 顶部「保存」：整体后台导出全部页面为无损 PNG
+    //   完全独立于预览：新建 fd + 新 renderer，在独立 IO 线程运行
+    //   用户此期间可继续翻页浏览，互不阻塞
     // ==================================================
     fun saveAllPages(context: Context) {
+        val uri = pdfUri ?: run { toastMsg = "请先打开 PDF"; return }
         val dirUri = outputDirUri ?: run { toastMsg = "请先选择输出文件夹"; return }
-        if (pdfRenderer == null) { toastMsg = "请先打开 PDF"; return }
-        if (isLoading) return
+        if (isSaving) return
+
+        val appContext = context.applicationContext
+        val nameSnapshot = pdfName
+
+        isSaving = true
+        saveProgressText = "准备中…"
+        saveProgressValue = 0f
 
         viewModelScope.launch {
-            isLoading = true
             var success = 0
             var fail = 0
+            var pfd: ParcelFileDescriptor? = null
+            var renderer: PdfRenderer? = null
             try {
-                withContext(pdfDispatcher) {
-                    for (i in 0 until pageCount) {
-                        statusText = "正在导出 ${i + 1}/$pageCount …"
+                withContext(Dispatchers.IO) {
+                    pfd = appContext.contentResolver.openFileDescriptor(uri, "r")
+                        ?: throw IllegalStateException("无法打开 PDF")
+                    renderer = PdfRenderer(pfd!!)
+                    val total = renderer!!.pageCount
+
+                    for (i in 0 until total) {
+                        saveProgressText = "正在导出 ${i + 1}/$total …"
+                        saveProgressValue = (i + 1).toFloat() / total
                         try {
-                            val bmp = renderPageInternal(i, EXPORT_DPI)
+                            val bmp = renderExportBitmap(renderer!!, i)
                             try {
-                                saveBitmap(context, dirUri, bmp, i)
-                                exportedPages.add(i)
+                                saveBitmap(appContext, dirUri, bmp, i, nameSnapshot)
                                 success++
                             } finally {
                                 try { bmp.recycle() } catch (_: Throwable) {}
@@ -128,129 +150,105 @@ class PdfViewModel : ViewModel() {
                     }
                 }
                 toastMsg = buildString {
-                    append("整体导出完成：成功 $success 张")
+                    append("导出完成：成功 $success 张")
                     if (fail > 0) append("，失败 $fail 张")
                 }
-            } finally {
-                statusText = ""
-                isLoading = false
-            }
-        }
-    }
-
-    // ==================================================
-    // 底部「上一页」：先导出当前页（受跳过影响），再翻页
-    // ==================================================
-    fun goPrev(context: Context) {
-        if (currentPage <= 0 || isLoading) return
-        viewModelScope.launch {
-            isLoading = true
-            try {
-                withContext(pdfDispatcher) {
-                    exportCurrentInternal(context)
-                    val newPage = currentPage - 1
-                    currentPage = newPage
-                    currentBitmap = renderPageInternal(newPage, PREVIEW_DPI)
-                }
             } catch (t: Throwable) {
-                toastMsg = "翻页失败：${t.message}"
+                toastMsg = "导出失败：${t.message}"
             } finally {
-                isLoading = false
+                try { renderer?.close() } catch (_: Throwable) {}
+                try { pfd?.close() } catch (_: Throwable) {}
+                isSaving = false
+                saveProgressText = ""
+                saveProgressValue = 0f
             }
         }
     }
 
     // ==================================================
-    // 底部「下一页」：先导出当前页（受跳过影响），再翻页
+    // 底部「上一页」：仅更新预览，不触发导出
     // ==================================================
-    fun goNext(context: Context) {
-        if (currentPage >= pageCount - 1 || isLoading) return
+    fun goPrev() {
+        if (currentPage <= 0 || isPreviewLoading) return
+        launchPreview(currentPage - 1)
+    }
+
+    // ==================================================
+    // 底部「下一页」：仅更新预览，不触发导出
+    // ==================================================
+    fun goNext() {
+        if (currentPage >= pageCount - 1 || isPreviewLoading) return
+        launchPreview(currentPage + 1)
+    }
+
+    // ==================================================
+    // 底部「跳过」：预留（当前导出为整体导出，跳过不影响）
+    //   如后续需要"单张导出模式"，可在此维护 skipped 集合
+    // ==================================================
+    fun skipCurrent() {
+        if (currentPage >= pageCount - 1 || isPreviewLoading) return
+        launchPreview(currentPage + 1)
+    }
+
+    // ==================================================
+    // 内部：翻页只做预览渲染
+    // ==================================================
+    private fun launchPreview(target: Int) {
         viewModelScope.launch {
-            isLoading = true
+            isPreviewLoading = true
             try {
-                withContext(pdfDispatcher) {
-                    exportCurrentInternal(context)
-                    val newPage = currentPage + 1
-                    currentPage = newPage
-                    currentBitmap = renderPageInternal(newPage, PREVIEW_DPI)
-                }
-            } catch (t: Throwable) {
-                toastMsg = "翻页失败：${t.message}"
-            } finally {
-                isLoading = false
-            }
-        }
-    }
-
-    // ==================================================
-    // 底部「跳过」：标记当前页不参与单张导出，自动翻到下一页
-    // ==================================================
-    fun skipCurrent(context: Context) {
-        if (isLoading) return
-        skippedPages = skippedPages + currentPage
-        if (currentPage < pageCount - 1) {
-            viewModelScope.launch {
-                isLoading = true
-                try {
-                    withContext(pdfDispatcher) {
-                        val newPage = currentPage + 1
-                        currentPage = newPage
-                        currentBitmap = renderPageInternal(newPage, PREVIEW_DPI)
+                withContext(previewDispatcher) {
+                    currentPage = target
+                    try {
+                        val bmp = renderPreviewBitmap(target)
+                        currentBitmap = bmp
+                    } catch (t: Throwable) {
+                        toastMsg = "预览失败：${t.message}"
                     }
-                } catch (t: Throwable) {
-                    toastMsg = "翻页失败：${t.message}"
-                } finally {
-                    isLoading = false
                 }
-            }
-        }
-    }
-
-    // ==================================================
-    // 内部：单张导出（受「跳过」影响）
-    // ==================================================
-    private fun exportCurrentInternal(context: Context) {
-        val dirUri = outputDirUri ?: return
-        if (pdfRenderer == null) return
-        val idx = currentPage
-
-        if (idx in skippedPages) {
-            toastMsg = "第 ${idx + 1} 页已跳过，未导出"
-            return
-        }
-        if (idx in exportedPages) return
-
-        try {
-            val bmp = renderPageInternal(idx, EXPORT_DPI)
-            try {
-                saveBitmap(context, dirUri, bmp, idx)
-                exportedPages.add(idx)
-                toastMsg = "已导出第 ${idx + 1} 页"
             } finally {
-                try { bmp.recycle() } catch (_: Throwable) {}
+                isPreviewLoading = false
             }
-        } catch (t: Throwable) {
-            toastMsg = "第 ${idx + 1} 页导出失败：${t.message}"
         }
     }
 
     // ==================================================
-    // 核心：渲染一页为 Bitmap（带内存预算保护）
-    // 像素 = PDF point × (dpi / 72)
+    // 预览渲染：低质量快速（100 DPI + RGB_565）
     // ==================================================
-    private fun renderPageInternal(index: Int, dpi: Int): Bitmap {
-        val renderer = pdfRenderer ?: throw IllegalStateException("PDF 未打开")
-        if (index < 0 || index >= renderer.pageCount) {
-            throw IllegalArgumentException("页码越界：$index")
-        }
+    private fun renderPreviewBitmap(index: Int): Bitmap {
+        val renderer = previewRenderer ?: throw IllegalStateException("PDF 未打开")
         val page = renderer.openPage(index)
         try {
-            val scale = dpi / 72f
+            val scale = PREVIEW_DPI / 72f
+            var w = (page.width * scale).toInt().coerceAtLeast(1)
+            var h = (page.height * scale).toInt().coerceAtLeast(1)
+            val maxSide = maxOf(w, h)
+            if (maxSide > PREVIEW_MAX_SIDE) {
+                val r = PREVIEW_MAX_SIDE.toFloat() / maxSide
+                w = (w * r).toInt().coerceAtLeast(1)
+                h = (h * r).toInt().coerceAtLeast(1)
+            }
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+            bmp.eraseColor(Color.WHITE)
+            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            return bmp
+        } finally {
+            try { page.close() } catch (_: Throwable) {}
+        }
+    }
+
+    // ==================================================
+    // 导出渲染：无损级（300 DPI + ARGB_8888）
+    // ==================================================
+    private fun renderExportBitmap(renderer: PdfRenderer, index: Int): Bitmap {
+        val page = renderer.openPage(index)
+        try {
+            val scale = EXPORT_DPI / 72f
             var w = (page.width * scale).toInt().coerceAtLeast(1)
             var h = (page.height * scale).toInt().coerceAtLeast(1)
 
-            // 内存预算保护：ARGB_8888 每像素 4 字节
-            val maxPixels = MAX_BITMAP_BYTES / 4L
+            // 内存预算保护
+            val maxPixels = EXPORT_MAX_BITMAP_BYTES / 4L
             val pixels = w.toLong() * h.toLong()
             if (pixels > maxPixels) {
                 val r = sqrt(maxPixels.toDouble() / pixels.toDouble())
@@ -268,12 +266,18 @@ class PdfViewModel : ViewModel() {
     }
 
     // ==================================================
-    // 保存 Bitmap 为 PNG 到 SAF 目录（PNG 为无损格式）
+    // 保存 PNG（无损压缩）到 SAF 目录
     // ==================================================
-    private fun saveBitmap(context: Context, dirUri: Uri, bmp: Bitmap, pageIndex: Int) {
+    private fun saveBitmap(
+        context: Context,
+        dirUri: Uri,
+        bmp: Bitmap,
+        pageIndex: Int,
+        nameForFile: String
+    ) {
         val dir = DocumentFile.fromTreeUri(context, dirUri) ?: error("目录无效")
         if (!dir.canWrite()) error("无写入权限，请重新选择输出文件夹")
-        val base = pdfName.substringBeforeLast('.', pdfName).ifBlank { "pdf" }
+        val base = nameForFile.substringBeforeLast('.', nameForFile).ifBlank { "pdf" }
         val fileName = "${base}_page_${pageIndex + 1}.png"
         try { dir.findFile(fileName)?.delete() } catch (_: Throwable) {}
         val file = dir.createFile("image/png", fileName) ?: error("创建文件失败")
@@ -294,18 +298,18 @@ class PdfViewModel : ViewModel() {
         }
     } catch (_: Throwable) { null }
 
-    private fun closeInternal() {
-        try { pdfRenderer?.close() } catch (_: Throwable) {}
-        pdfRenderer = null
-        try { pfd?.close() } catch (_: Throwable) {}
-        pfd = null
+    private fun closePreviewInternal() {
+        try { previewRenderer?.close() } catch (_: Throwable) {}
+        previewRenderer = null
+        try { previewPfd?.close() } catch (_: Throwable) {}
+        previewPfd = null
     }
 
     override fun onCleared() {
         super.onCleared()
-        closeInternal()
-        // 关键：不显式 recycle currentBitmap，交给 GC，避免 Compose 绘制时崩溃
+        closePreviewInternal()
+        // 预览位图交由 GC，不显式 recycle，避免 Compose 绘制时崩溃
         currentBitmap = null
-        try { pdfExecutor.shutdown() } catch (_: Throwable) {}
+        try { previewExecutor.shutdown() } catch (_: Throwable) {}
     }
 }
