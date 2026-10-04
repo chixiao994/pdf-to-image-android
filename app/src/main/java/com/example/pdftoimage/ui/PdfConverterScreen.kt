@@ -16,6 +16,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.pdftoimage.PdfKind
 import com.example.pdftoimage.PdfViewModel
 
 @Composable
@@ -51,7 +52,7 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
 
     Scaffold(
         // ============================================================
-        // 顶部栏：标题居中 + 输入/输出/保存 三个文字按钮均分
+        // 顶部栏：标题居中 + 输入/输出/保存 三按钮均分
         // ============================================================
         topBar = {
             Surface(
@@ -98,11 +99,39 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
                             text = if (vm.isSaving) "保存中…" else "保存",
                             enabled = vm.pdfUri != null &&
                                 vm.outputDirUri != null &&
-                                !vm.isSaving,
+                                !vm.isSaving &&
+                                !vm.isDetectingKind,
                             onClick = { vm.saveAllPages(context) }
                         )
                     }
-                    // 保存进度条（后台进行时显示，不阻塞浏览）
+                    // 类型判定提示
+                    if (vm.isDetectingKind) {
+                        Text(
+                            "正在识别 PDF 类型…",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(
+                                horizontal = 12.dp, vertical = 4.dp
+                            ),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    } else if (vm.pdfUri != null && vm.pdfKind != PdfKind.UNKNOWN) {
+                        val label = when (vm.pdfKind) {
+                            PdfKind.SCANNED -> "扫描件 · 将无损提取原图"
+                            PdfKind.VECTOR -> "矢量文档 · 将 300 DPI 渲染"
+                            PdfKind.UNKNOWN -> ""
+                        }
+                        if (label.isNotEmpty()) {
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(
+                                    horizontal = 12.dp, vertical = 4.dp
+                                ),
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+                    }
+                    // 保存进度
                     if (vm.isSaving) {
                         Column(Modifier.fillMaxWidth()) {
                             LinearProgressIndicator(
@@ -124,7 +153,7 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
         },
 
         // ============================================================
-        // 底部栏：上一页 / 跳过 / 下一页 三个文字按钮均分
+        // 底部栏：上一页 / 跳过 / 下一页 三个按钮均分
         // ============================================================
         bottomBar = {
             if (vm.pdfUri != null) {
@@ -243,7 +272,7 @@ private fun RowScope.TopBarButton(
 }
 
 // ============================================================
-// 底部栏按钮（RowScope 扩展）
+// 底部栏按钮
 // ============================================================
 @Composable
 private fun RowScope.BottomBarButton(
