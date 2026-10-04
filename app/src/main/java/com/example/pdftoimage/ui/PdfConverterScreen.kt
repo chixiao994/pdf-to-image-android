@@ -51,7 +51,7 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
 
     Scaffold(
         // ============================================================
-        // 顶部栏：标题居中 + 输入/输出/保存 三个按钮均分
+        // 顶部栏：标题居中 + 输入/输出/保存 三个文字按钮均分
         // ============================================================
         topBar = {
             Surface(
@@ -64,7 +64,7 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
                         .fillMaxWidth()
                         .statusBarsPadding()
                 ) {
-                    // 标题（居中）
+                    // 标题居中
                     Box(
                         Modifier
                             .fillMaxWidth()
@@ -86,28 +86,45 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
                     ) {
                         TopBarButton(
                             text = "输入",
-                            enabled = !vm.isLoading,
+                            enabled = !vm.isPreviewLoading,
                             onClick = { pdfPicker.launch(arrayOf("application/pdf")) }
                         )
                         TopBarButton(
                             text = "输出",
-                            enabled = vm.pdfUri != null && !vm.isLoading,
+                            enabled = vm.pdfUri != null && !vm.isPreviewLoading,
                             onClick = { dirPicker.launch(null) }
                         )
                         TopBarButton(
-                            text = "保存",
+                            text = if (vm.isSaving) "保存中…" else "保存",
                             enabled = vm.pdfUri != null &&
                                 vm.outputDirUri != null &&
-                                !vm.isLoading,
+                                !vm.isSaving,
                             onClick = { vm.saveAllPages(context) }
                         )
+                    }
+                    // 保存进度条（后台进行时显示，不阻塞浏览）
+                    if (vm.isSaving) {
+                        Column(Modifier.fillMaxWidth()) {
+                            LinearProgressIndicator(
+                                progress = { vm.saveProgressValue },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Text(
+                                vm.saveProgressText,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(
+                                    horizontal = 12.dp, vertical = 4.dp
+                                ),
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
                     }
                 }
             }
         },
 
         // ============================================================
-        // 底部栏：上一页 / 跳过 / 下一页 三个按钮均分
+        // 底部栏：上一页 / 跳过 / 下一页 三个文字按钮均分
         // ============================================================
         bottomBar = {
             if (vm.pdfUri != null) {
@@ -124,20 +141,19 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
                     ) {
                         BottomBarButton(
                             text = "上一页",
-                            enabled = vm.currentPage > 0 && !vm.isLoading,
-                            onClick = { vm.goPrev(context) }
+                            enabled = vm.currentPage > 0 && !vm.isPreviewLoading,
+                            onClick = { vm.goPrev() }
                         )
-                        val isSkipped = vm.currentPage in vm.skippedPages
                         BottomBarButton(
-                            text = if (isSkipped) "已跳过" else "跳过",
-                            enabled = !vm.isLoading,
-                            highlighted = isSkipped,
-                            onClick = { vm.skipCurrent(context) }
+                            text = "跳过",
+                            enabled = !vm.isPreviewLoading,
+                            onClick = { vm.skipCurrent() }
                         )
                         BottomBarButton(
                             text = "下一页",
-                            enabled = vm.currentPage < vm.pageCount - 1 && !vm.isLoading,
-                            onClick = { vm.goNext(context) }
+                            enabled = vm.currentPage < vm.pageCount - 1 &&
+                                !vm.isPreviewLoading,
+                            onClick = { vm.goNext() }
                         )
                     }
                 }
@@ -154,22 +170,6 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
             contentAlignment = Alignment.Center
         ) {
             when {
-                vm.isLoading -> Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    CircularProgressIndicator()
-                    if (vm.statusText.isNotEmpty()) {
-                        Text(vm.statusText)
-                    }
-                    if (vm.pageCount > 0) {
-                        Text(
-                            "第 ${vm.currentPage + 1} / ${vm.pageCount} 页",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-
                 vm.currentBitmap != null -> Column(
                     Modifier.fillMaxSize(),
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -179,15 +179,25 @@ fun PdfConverterScreen(vm: PdfViewModel = viewModel()) {
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.padding(vertical = 8.dp)
                     )
-                    Image(
-                        bitmap = vm.currentBitmap!!.asImageBitmap(),
-                        contentDescription = null,
-                        modifier = Modifier
+                    Box(
+                        Modifier
                             .fillMaxSize()
                             .padding(8.dp),
-                        contentScale = ContentScale.Fit
-                    )
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Image(
+                            bitmap = vm.currentBitmap!!.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
+                        )
+                        if (vm.isPreviewLoading) {
+                            CircularProgressIndicator()
+                        }
+                    }
                 }
+
+                vm.isPreviewLoading -> CircularProgressIndicator()
 
                 else -> Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -239,7 +249,6 @@ private fun RowScope.TopBarButton(
 private fun RowScope.BottomBarButton(
     text: String,
     enabled: Boolean,
-    highlighted: Boolean = false,
     onClick: () -> Unit
 ) {
     TextButton(
@@ -252,9 +261,7 @@ private fun RowScope.BottomBarButton(
         Text(
             text,
             style = MaterialTheme.typography.titleMedium,
-            fontWeight = if (highlighted) FontWeight.Bold else FontWeight.Medium,
-            color = if (highlighted) MaterialTheme.colorScheme.primary
-            else LocalContentColor.current
+            fontWeight = FontWeight.Medium
         )
     }
 }
