@@ -26,14 +26,24 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.7'
+          cache-read-only: false
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew || true
 
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: gradle assembleDebug --no-daemon --stacktrace --info
+
+      - name: Show build reports on failure
+        if: failure()
+        run: |
+          echo "============ LINT / BUILD REPORTS ============"
+          find . -path '*/build/reports/*' -type f -name '*.html' -o -name '*.txt' | head -50
+          echo "============ GRADLE LOG TAIL ============"
+          find . -name "*.log" -type f -exec tail -n 200 {} \; || true
 
       - name: Upload Debug APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
@@ -45,16 +55,9 @@ jobs:
         run: gradle assembleRelease --no-daemon --stacktrace
 
       - name: Upload Release APK
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && success()
         uses: actions/upload-artifact@v4
         with:
           name: app-release-unsigned
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: warn
-
-      - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: app/build/outputs/apk/release/*.apk
-          generate_release_notes: true
