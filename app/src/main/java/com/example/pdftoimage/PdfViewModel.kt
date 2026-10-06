@@ -37,11 +37,9 @@ class PdfViewModel : ViewModel() {
     var currentBitmap: Bitmap? by mutableStateOf(null); private set
     var isPreviewLoading: Boolean by mutableStateOf(false); private set
 
-    // PDF 类型检测
     var pdfKind: PdfKind by mutableStateOf(PdfKind.UNKNOWN); private set
     var isDetectingKind: Boolean by mutableStateOf(false); private set
 
-    // 保存状态
     var isSaving: Boolean by mutableStateOf(false); private set
     var saveProgressText: String by mutableStateOf(""); private set
     var saveProgressValue: Float by mutableStateOf(0f); private set
@@ -65,9 +63,15 @@ class PdfViewModel : ViewModel() {
         const val EXPORT_DPI = 300
         const val EXPORT_MAX_BITMAP_BYTES = 120L * 1024 * 1024
 
-        // 分块处理页数：每处理 CHUNK 页重新打开 PDF，释放 PDFBox 内部缓存
-        // 若大文件仍然闪退，将此值降到 10 或 5
-        const val EXTRACTION_CHUNK = 20
+        // 内存检查间隔：每处理这么多页检查一次堆使用情况
+        const val MEMORY_CHECK_INTERVAL = 30
+
+        // 堆使用率阈值：超过这个比例才重开 PDDocument
+        // 0.5 表示堆使用超过 50% 就重开；内存充裕的设备可调到 0.7
+        const val MEMORY_RESTART_THRESHOLD = 0.5
+
+        // PDFBox 主内存缓存上限（超出部分自动 spill 到临时文件）
+        const val PDFBOX_CACHE_BYTES = 4L * 1024 * 1024
     }
 
     // ==================================================
@@ -177,15 +181,13 @@ class PdfViewModel : ViewModel() {
                 isSaving = false
                 saveProgressText = ""
                 saveProgressValue = 0f
-                // 完成后触发一次 GC，释放 PDFBox 残留
-                System.gc()
             }
         }
     }
 
     // ==================================================
-    // 路径 A：扫描件 → 提取原始图像（分块处理，防 OOM）
-    //   每 EXTRACTION_CHUNK 页重新打开一次 PDDocument
+    // 路径 A：扫描件 → 提取原始图像
+    //   按需重启 PDDocument：只在堆使用超过阈值时才重开
     // ==================================================
     private suspend fun exportByExtraction(
         context: Context, pdfFile: File, dirUri: Uri, nameSnapshot: String
@@ -194,21 +196,23 @@ class PdfViewModel : ViewModel() {
         if (!dir.canWrite()) error("输出目录无写入权限")
         val base = nameSnapshot.substringBeforeLast('.', nameSnapshot).ifBlank { "pdf" }
 
-        // 回退渲染器（惰性创建，跨块复用）
         var fallbackPfd: ParcelFileDescriptor? = null
         var fallbackRenderer: PdfRenderer? = null
+        var currentRr: RandomAccessBufferedFileInputStream? = null
+        var currentDoc: PDDocument? = null
 
         var success = 0
         var fail = 0
+        var restartCount = 0
 
         try {
-            // 1. 快速获取总页数（极小内存配置，读完立刻释放）
+            // ---------- 1. 快速获取总页数 ----------
             val totalPages: Int = withContext(Dispatchers.IO) {
                 var rr: RandomAccessBufferedFileInputStream? = null
                 try {
                     rr = RandomAccessBufferedFileInputStream(pdfFile)
-                    val mem = MemoryUsageSetting.setupMixed(2L * 1024 * 1024)
-                    PDDocument.load(rr, mem).use { it.numberOfPages }
+                    PDDocument.load(rr, MemoryUsageSetting.setupMixed(2L * 1024 * 1024))
+                        .use { it.numberOfPages }
                 } finally {
                     try { rr?.close() } catch (_: Throwable) {}
                 }
@@ -218,86 +222,115 @@ class PdfViewModel : ViewModel() {
                 return
             }
 
-            // 2. 分块处理
-            var start = 0
-            while (start < totalPages) {
-                val end = minOf(start + EXTRACTION_CHUNK, totalPages)
-                var rr: RandomAccessBufferedFileInputStream? = null
-                try {
-                    withContext(Dispatchers.IO) {
-                        rr = RandomAccessBufferedFileInputStream(pdfFile)
-                        val mem = MemoryUsageSetting.setupMixed(4L * 1024 * 1024)
-                        PDDocument.load(rr, mem).use { doc ->
-                            for (i in start until end) {
-                                saveProgressText = "提取 ${i + 1}/$totalPages …"
-                                saveProgressValue = (i + 1).toFloat() / totalPages
-                                try {
-                                    val page = doc.getPage(i)
-                                    val jpgName = "${base}_page_${i + 1}.jpg"
-                                    val pngName = "${base}_page_${i + 1}.png"
+            // ---------- 2. 打开文档 ----------
+            withContext(Dispatchers.IO) {
+                currentRr = RandomAccessBufferedFileInputStream(pdfFile)
+                currentDoc = PDDocument.load(
+                    currentRr!!,
+                    MemoryUsageSetting.setupMixed(PDFBOX_CACHE_BYTES)
+                )
+            }
 
-                                    // 清理同名旧文件
-                                    try { dir.findFile(jpgName)?.delete() } catch (_: Throwable) {}
-                                    try { dir.findFile(pngName)?.delete() } catch (_: Throwable) {}
+            // ---------- 3. 逐页处理 ----------
+            withContext(Dispatchers.IO) {
+                var i = 0
+                while (i < totalPages) {
+                    try {
+                        val page = currentDoc!!.getPage(i)
+                        saveProgressText = "提取 ${i + 1}/$totalPages …"
+                        saveProgressValue = (i + 1).toFloat() / totalPages
 
-                                    // 尝试直接提取 JPEG
-                                    var extracted = false
-                                    val jpgFile = dir.createFile("image/jpeg", jpgName)
-                                    if (jpgFile != null) {
-                                        context.contentResolver
-                                            .openOutputStream(jpgFile.uri, "w")
-                                            ?.use { os ->
-                                                BufferedOutputStream(os, 64 * 1024).use { bout ->
-                                                    val ext = PdfExtractor.extractRawImage(page, bout)
-                                                    if (ext != null) extracted = true
-                                                }
-                                            }
+                        val jpgName = "${base}_page_${i + 1}.jpg"
+                        val pngName = "${base}_page_${i + 1}.png"
+
+                        try { dir.findFile(jpgName)?.delete() } catch (_: Throwable) {}
+                        try { dir.findFile(pngName)?.delete() } catch (_: Throwable) {}
+
+                        // 尝试直接提取 JPEG
+                        var extracted = false
+                        val jpgFile = dir.createFile("image/jpeg", jpgName)
+                        if (jpgFile != null) {
+                            context.contentResolver
+                                .openOutputStream(jpgFile.uri, "w")
+                                ?.use { os ->
+                                    BufferedOutputStream(os, 64 * 1024).use { bout ->
+                                        val ext = PdfExtractor.extractRawImage(page, bout)
+                                        if (ext != null) extracted = true
                                     }
-
-                                    if (extracted) {
-                                        success++
-                                    } else {
-                                        // 回退：删除占位 JPG，改渲染为 PNG
-                                        try { jpgFile?.delete() } catch (_: Throwable) {}
-                                        if (fallbackRenderer == null) {
-                                            fallbackPfd = ParcelFileDescriptor.open(
-                                                pdfFile, ParcelFileDescriptor.MODE_READ_ONLY
-                                            )
-                                            fallbackRenderer = PdfRenderer(fallbackPfd!!)
-                                        }
-                                        val bmp = renderExportBitmap(fallbackRenderer!!, i)
-                                        try {
-                                            saveBitmapAsPng(context, dir, bmp, pngName)
-                                            success++
-                                        } finally {
-                                            try { bmp.recycle() } catch (_: Throwable) {}
-                                        }
-                                    }
-                                } catch (t: Throwable) {
-                                    fail++
                                 }
+                        }
+
+                        if (extracted) {
+                            success++
+                        } else {
+                            // 回退：删除占位 JPG，改渲染为 PNG
+                            try { jpgFile?.delete() } catch (_: Throwable) {}
+                            if (fallbackRenderer == null) {
+                                fallbackPfd = ParcelFileDescriptor.open(
+                                    pdfFile, ParcelFileDescriptor.MODE_READ_ONLY
+                                )
+                                fallbackRenderer = PdfRenderer(fallbackPfd!!)
+                            }
+                            val bmp = renderExportBitmap(fallbackRenderer!!, i)
+                            try {
+                                saveBitmapAsPng(context, dir, bmp, pngName)
+                                success++
+                            } finally {
+                                try { bmp.recycle() } catch (_: Throwable) {}
                             }
                         }
+                    } catch (t: Throwable) {
+                        fail++
                     }
-                } catch (t: Throwable) {
-                    // 整块失败：记录失败页数
-                    fail += (end - start)
-                } finally {
-                    try { rr?.close() } catch (_: Throwable) {}
-                }
 
-                // 每块结束触发 GC，释放 PDFBox 内部缓存
-                System.gc()
-                start = end
+                    i++
+
+                    // ---------- 内存检查：仅在超过阈值时重开 ----------
+                    if (i < totalPages && i % MEMORY_CHECK_INTERVAL == 0) {
+                        if (shouldRestartDocument()) {
+                            saveProgressText = "释放缓存中…（已完成 $i/$totalPages）"
+                            try { currentDoc?.close() } catch (_: Throwable) {}
+                            try { currentRr?.close() } catch (_: Throwable) {}
+                            currentDoc = null
+                            currentRr = null
+                            System.gc()
+
+                            currentRr = RandomAccessBufferedFileInputStream(pdfFile)
+                            currentDoc = PDDocument.load(
+                                currentRr!!,
+                                MemoryUsageSetting.setupMixed(PDFBOX_CACHE_BYTES)
+                            )
+                            restartCount++
+                        }
+                    }
+                }
             }
 
             toastMsg = buildString {
                 append("提取完成：成功 $success 张")
                 if (fail > 0) append("，失败 $fail 张")
+                if (restartCount > 0) append("（内存重开 $restartCount 次）")
             }
         } finally {
+            try { currentDoc?.close() } catch (_: Throwable) {}
+            try { currentRr?.close() } catch (_: Throwable) {}
             try { fallbackRenderer?.close() } catch (_: Throwable) {}
             try { fallbackPfd?.close() } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * 判断是否需要重开 PDDocument
+     * 堆使用超过 max * MEMORY_RESTART_THRESHOLD 时返回 true
+     */
+    private fun shouldRestartDocument(): Boolean {
+        return try {
+            val rt = Runtime.getRuntime()
+            val used = rt.totalMemory() - rt.freeMemory()
+            val max = rt.maxMemory()
+            used > (max * MEMORY_RESTART_THRESHOLD).toLong()
+        } catch (_: Throwable) {
+            true   // 保守：检查失败时重开
         }
     }
 
@@ -387,7 +420,7 @@ class PdfViewModel : ViewModel() {
     }
 
     // ==================================================
-    // 预览渲染：100 DPI + 单边 ≤ 1600（ARGB_8888 为 PdfRenderer 硬要求）
+    // 预览渲染
     // ==================================================
     private fun renderPreviewBitmap(index: Int): Bitmap {
         val renderer = previewRenderer ?: throw IllegalStateException("PDF 未打开")
@@ -412,7 +445,7 @@ class PdfViewModel : ViewModel() {
     }
 
     // ==================================================
-    // 导出渲染：300 DPI + ARGB_8888（带内存预算保护）
+    // 导出渲染
     // ==================================================
     private fun renderExportBitmap(renderer: PdfRenderer, index: Int): Bitmap {
         val page = renderer.openPage(index)
@@ -439,7 +472,7 @@ class PdfViewModel : ViewModel() {
     }
 
     // ==================================================
-    // 保存 Bitmap 为 PNG（无损）
+    // 保存 Bitmap 为 PNG
     // ==================================================
     private fun saveBitmapAsPng(
         context: Context, dir: DocumentFile, bmp: Bitmap, fileName: String
