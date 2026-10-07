@@ -1,6 +1,7 @@
 package com.example.pdftoimage
 
 import android.content.Context
+import com.tom_roush.pdfbox.cos.COSArray
 import com.tom_roush.pdfbox.cos.COSName
 import com.tom_roush.pdfbox.cos.COSStream
 import com.tom_roush.pdfbox.io.MemoryUsageSetting
@@ -20,7 +21,6 @@ enum class PdfKind {
 
 object PdfExtractor {
 
-    /** 判定类型：抽样前 N 页 */
     fun detectPdfKind(
         context: Context,
         pdfFile: File,
@@ -56,7 +56,6 @@ object PdfExtractor {
         return (0 until sampleSize).map { (it * step).toInt() }.distinct()
     }
 
-    /** 判断一页是否为整页大尺寸扫描图 */
     fun isFullPageScannedImage(page: PDPage): Boolean {
         return try {
             val resources = page.resources ?: return false
@@ -74,46 +73,112 @@ object PdfExtractor {
         }
     }
 
-    /**
-     * 提取页面上最大图像的原始字节流。
-     * 仅处理 JPEG（DCTDecode），其他返回 null 由调用方回退到渲染。
-     *
-     * 改进点：
-     *  - 用 PDImageXObject.suffix 判断格式（PDFBox 内部会综合 filter 数组）
-     *  - cosObject 做安全 cast，避免类型异常
-     */
-    fun extractRawImage(page: PDPage, out: OutputStream): String? {
+    private fun readFilterNames(cos: COSStream): List<String> {
+        val names = mutableListOf<String>()
+        val filterObj = cos.getDictionaryObject(COSName.FILTER)
+        when (filterObj) {
+            is COSName -> names.add(filterObj.name)
+            is COSArray -> {
+                for (i in 0 until filterObj.size()) {
+                    val item = filterObj.getObject(i)
+                    if (item is COSName) names.add(item.name)
+                }
+            }
+        }
+        return names
+    }
+
+    private fun findLargestImage(page: PDPage): PDImageXObject? {
+        val resources = page.resources ?: return null
+        var best: PDImageXObject? = null
+        var bestArea = 0L
+        for (name in resources.xObjectNames) {
+            val obj = try { resources.getXObject(name) } catch (_: Throwable) { null }
+            if (obj is PDImageXObject) {
+                val area = obj.width.toLong() * obj.height.toLong()
+                if (area > bestArea) {
+                    bestArea = area
+                    best = obj
+                }
+            }
+        }
+        return best
+    }
+
+    /** 判断页面主图能否无损直出 */
+    fun detectRawFormat(page: PDPage): String? {
         return try {
-            val resources = page.resources ?: return null
-
-            // 找到页面里面积最大的图像（页眉小图标会被跳过）
-            var best: PDImageXObject? = null
-            var bestArea = 0L
-            for (name in resources.xObjectNames) {
-                val obj = try { resources.getXObject(name) } catch (_: Throwable) { null }
-                if (obj is PDImageXObject) {
-                    val area = obj.width.toLong() * obj.height.toLong()
-                    if (area > bestArea) {
-                        bestArea = area
-                        best = obj
-                    }
-                }
+            val target = findLargestImage(page) ?: return null
+            val cos = target.cosObject as? COSStream ?: return null
+            val filters = readFilterNames(cos)
+            when {
+                filters.contains("DCTDecode") -> "jpg"
+                filters.contains("JPXDecode") -> "jp2"
+                filters.contains("CCITTFaxDecode") -> "tif"
+                else -> null
             }
-            val target = best ?: return null
-
-            // 用 PDFBox 的 suffix 判断格式
-            // suffix = "jpg"/"jpeg" 时说明底层就是 DCTDecode，可以直出原始字节
-            val suffix = try { target.suffix } catch (_: Throwable) { null }
-            if (suffix == "jpg" || suffix == "jpeg") {
-                val cos = target.cosObject as? COSStream ?: return null
-                cos.createRawInputStream().use { input ->
-                    input.copyTo(out, bufferSize = 128 * 1024)
-                }
-                return "jpg"
-            }
-            null
         } catch (t: Throwable) {
             null
+        }
+    }
+
+    /** 直出原始字节流 */
+    fun extractRawBytes(page: PDPage, out: OutputStream): Boolean {
+        return try {
+            val target = findLargestImage(page) ?: return false
+            val cos = target.cosObject as? COSStream ?: return false
+            val filters = readFilterNames(cos)
+            if (!filters.contains("DCTDecode") &&
+                !filters.contains("JPXDecode") &&
+                !filters.contains("CCITTFaxDecode")
+            ) {
+                return false
+            }
+            cos.createRawInputStream().use { input ->
+                input.copyTo(out, bufferSize = 256 * 1024)
+            }
+            out.flush()
+            true
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * 估算页面主图对应的原始 DPI。
+     *
+     * 原理：
+     *   PDF 里页面尺寸用 point 表示，1 point = 1/72 英寸
+     *   图像像素宽 / (页面宽 point / 72) = 图像每英寸像素数 = 原始 DPI
+     *
+     * 返回：
+     *   - 若页面无主图或计算失败 → 返回 minDpi
+     *   - 否则返回 clamp(原图 DPI, minDpi, maxDpi)
+     *
+     * 用途：让 PdfRenderer 以匹配原图的分辨率渲染，避免降采样导致的模糊。
+     */
+    fun estimateRequiredDpi(
+        page: PDPage,
+        minDpi: Int = 300,
+        maxDpi: Int = 600
+    ): Int {
+        return try {
+            val image = findLargestImage(page) ?: return minDpi
+            val pageWpt = page.mediaBox.width
+            val pageHpt = page.mediaBox.height
+            if (pageWpt <= 0f || pageHpt <= 0f) return minDpi
+
+            // 图像像素 / (页面点数 / 72) = 原始 DPI
+            val dpiW = image.width.toFloat() / pageWpt * 72f
+            val dpiH = image.height.toFloat() / pageHpt * 72f
+            // 取两者较小值作为有效 DPI，避免非等比缩放
+            val effective = minOf(dpiW, dpiH).toInt()
+
+            // 加入 5% 余量取整，避免因浮点误差导致轻微降采样
+            val withMargin = (effective * 1.05f).toInt()
+            withMargin.coerceIn(minDpi, maxDpi)
+        } catch (t: Throwable) {
+            minDpi
         }
     }
 }
