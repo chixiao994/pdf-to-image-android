@@ -63,12 +63,19 @@ class PdfViewModel : ViewModel() {
         const val EXPORT_DPI = 300
         const val EXPORT_MAX_BITMAP_BYTES = 120L * 1024 * 1024
 
+        // ---------- 内存管理参数 ----------
+
+        // 固定强制重开间隔：每处理这么多页必定重开一次 PDDocument
+        // 用户要求 100~200 页范围，取 150 作为默认值
+        // 如果觉得太慢，调到 200；如果还闪退，调到 100
+        const val FORCE_RESTART_PAGES = 150
+
         // 内存检查间隔：每处理这么多页检查一次堆使用情况
+        // 必须是 FORCE_RESTART_PAGES 的因子，否则强制重开点可能被跳过
         const val MEMORY_CHECK_INTERVAL = 30
 
-        // 堆使用率阈值：超过这个比例才重开 PDDocument
-        // 0.5 表示堆使用超过 50% 就重开；内存充裕的设备可调到 0.7
-        const val MEMORY_RESTART_THRESHOLD = 0.5
+        // 堆使用率兜底阈值：超过这个比例也提前重开
+        const val MEMORY_RESTART_THRESHOLD = 0.6
 
         // PDFBox 主内存缓存上限（超出部分自动 spill 到临时文件）
         const val PDFBOX_CACHE_BYTES = 4L * 1024 * 1024
@@ -187,7 +194,8 @@ class PdfViewModel : ViewModel() {
 
     // ==================================================
     // 路径 A：扫描件 → 提取原始图像
-    //   按需重启 PDDocument：只在堆使用超过阈值时才重开
+    //   每 FORCE_RESTART_PAGES 页强制重开 PDDocument
+    //   每 MEMORY_CHECK_INTERVAL 页检查内存，超阈值也重开
     // ==================================================
     private suspend fun exportByExtraction(
         context: Context, pdfFile: File, dirUri: Uri, nameSnapshot: String
@@ -285,10 +293,13 @@ class PdfViewModel : ViewModel() {
 
                     i++
 
-                    // ---------- 内存检查：仅在超过阈值时重开 ----------
+                    // ---------- 内存管理：固定间隔 + 内存兜底 ----------
                     if (i < totalPages && i % MEMORY_CHECK_INTERVAL == 0) {
-                        if (shouldRestartDocument()) {
-                            saveProgressText = "释放缓存中…（已完成 $i/$totalPages）"
+                        val hitForceInterval = (i % FORCE_RESTART_PAGES == 0)
+                        val memoryPressure = shouldRestartByMemory()
+                        if (hitForceInterval || memoryPressure) {
+                            val reason = if (hitForceInterval) "定期清理" else "内存偏高"
+                            saveProgressText = "释放缓存中（$reason）…$i/$totalPages"
                             try { currentDoc?.close() } catch (_: Throwable) {}
                             try { currentRr?.close() } catch (_: Throwable) {}
                             currentDoc = null
@@ -320,17 +331,16 @@ class PdfViewModel : ViewModel() {
     }
 
     /**
-     * 判断是否需要重开 PDDocument
-     * 堆使用超过 max * MEMORY_RESTART_THRESHOLD 时返回 true
+     * 判断堆使用是否超过兜底阈值
      */
-    private fun shouldRestartDocument(): Boolean {
+    private fun shouldRestartByMemory(): Boolean {
         return try {
             val rt = Runtime.getRuntime()
             val used = rt.totalMemory() - rt.freeMemory()
             val max = rt.maxMemory()
             used > (max * MEMORY_RESTART_THRESHOLD).toLong()
         } catch (_: Throwable) {
-            true   // 保守：检查失败时重开
+            false
         }
     }
 
